@@ -217,7 +217,7 @@ export const analyticsAPI = {
   searchEvents: async (params = {}) => { const r = await analyticsApi.get('/anpr/events', { params }); return r.data },
   getEventStats: async () => { const r = await analyticsApi.get('/anpr/events/stats'); return r.data },
   submitEvent: async (data) => { const r = await analyticsApi.post('/anpr/events', data); return r.data },
-  getFrameUrl: (eventId) => `/api/analytics/v1/anpr/frame/${eventId}`,
+  getFrameUrl: (eventId) => `/api/analytics/v1/anpr/frame/${eventId}?token=${localStorage.getItem('token') || ''}`,
 
   // Watchlist
   getWatchlist: async (params = {}) => { const r = await analyticsApi.get('/watchlist', { params }); return r.data },

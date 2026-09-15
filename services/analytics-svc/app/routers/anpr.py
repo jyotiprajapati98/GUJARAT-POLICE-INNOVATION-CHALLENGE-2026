@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Dict, Optional
 
 import cv2
+import numpy as np
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import func, desc
@@ -139,17 +140,46 @@ def create_event(
     return ANPREventResponse.model_validate(event)
 
 
+def _annotate_and_save(frame: np.ndarray, det: dict, frame_dir: str, frame_name: str) -> str:
+    """Draw vehicle bbox + plate text on frame, save JPEG, return filename."""
+    import numpy as np
+    annotated = frame.copy()
+    bbox = det.get("bbox")
+    scale = det.get("scale", 1.0)
+
+    if bbox:
+        # Scale bbox back to original frame size if frame was resized during detection
+        x1, y1, x2, y2 = [int(v / scale) for v in bbox]
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        label = f"{det['plate_text']}  {int(det['confidence'] * 100)}%"
+        cv2.rectangle(annotated, (x1, y1 - 28), (x1 + len(label) * 13, y1), (0, 255, 0), -1)
+        cv2.putText(annotated, label, (x1 + 4, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+
+    out_path = os.path.join(frame_dir, frame_name)
+    cv2.imwrite(out_path, annotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return frame_name
+
+
 def _process_video_job(job_id: str, video_path: str):
     """Run ANPR at 1fps on every frame of the uploaded video. Blocking — runs in threadpool."""
+    import numpy as np
     from app.services.anpr_engine import ANPREngine
+    from app.config import settings
 
     job = _jobs[job_id]
+
+    # Create a directory to store detected frames for this job
+    frame_dir = os.path.join(settings.FRAMES_DIR, "upload_test", job_id)
+    os.makedirs(frame_dir, exist_ok=True)
+    job["frame_dir"] = frame_dir
+
     cap = cv2.VideoCapture(video_path)
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     duration_s = total_frames / fps
-    sample_every = max(1, int(fps))  # 1fps — take one frame per second
+    sample_every = max(1, int(fps))  # 1fps
 
     job["total_frames"] = int(duration_s)
     job["status"] = "processing"
@@ -158,6 +188,7 @@ def _process_video_job(job_id: str, video_path: str):
     detections = []
     frame_idx = 0
     processed = 0
+    detection_counter = 0
 
     try:
         while True:
@@ -173,13 +204,18 @@ def _process_video_job(job_id: str, video_path: str):
                 if engine:
                     results = engine.detect(frame)
                     for det in results:
+                        detection_counter += 1
+                        frame_name = f"det_{detection_counter:04d}_{int(timestamp_s):04d}s.jpg"
+                        _annotate_and_save(frame, det, frame_dir, frame_name)
                         detections.append({
                             "plate_text": det["plate_text"],
                             "confidence": det["confidence"],
                             "detect_confidence": det["detect_confidence"],
                             "timestamp_s": round(timestamp_s, 2),
                             "timestamp_label": _fmt_seconds(timestamp_s),
+                            "frame_filename": frame_name,
                         })
+                        job["detections"] = detections  # update live so UI can see partial results
 
             frame_idx += 1
 
@@ -281,21 +317,55 @@ def get_video_test_result(
     return job
 
 
+@router.get("/upload-test/{job_id}/frames/{filename}")
+def get_test_frame(
+    job_id: str,
+    filename: str,
+    token: Optional[str] = Query(None, description="Bearer token (for <img> src usage)"),
+    db: Session = Depends(get_db),
+    credentials=Depends(__import__('fastapi.security', fromlist=['HTTPBearer']).HTTPBearer(auto_error=False)),
+):
+    """Serve an annotated frame image from a video test job."""
+    from app.auth import decode_token
+    raw_token = token
+    if not raw_token and credentials:
+        raw_token = credentials.credentials
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    decode_token(raw_token)
+    job = _jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    frame_path = os.path.join(job.get("frame_dir", ""), filename)
+    if not os.path.isfile(frame_path):
+        raise HTTPException(status_code=404, detail="Frame not found")
+    return FileResponse(frame_path, media_type="image/jpeg")
+
+
 @router.get("/frame/{event_id}")
 def get_frame(
     event_id: uuid.UUID,
+    token: Optional[str] = Query(None, description="Bearer token (for <img> src usage)"),
     db: Session = Depends(get_db),
-    current_user: TokenPayload = Depends(get_current_user),
+    credentials=Depends(__import__('fastapi.security', fromlist=['HTTPBearer']).HTTPBearer(auto_error=False)),
 ):
-    """Stream the captured frame JPEG for a given ANPR event."""
+    """
+    Stream the captured frame JPEG.
+    Accepts auth via Authorization header OR ?token= query param
+    (query param needed because <img src> cannot send headers).
+    """
+    from app.auth import decode_token
+    raw_token = token
+    if not raw_token and credentials:
+        raw_token = credentials.credentials
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    decode_token(raw_token)  # validates; raises 401 if invalid
+
     event = db.query(ANPREvent).filter(ANPREvent.id == event_id).first()
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
-    if not event.frame_path:
-        raise HTTPException(status_code=404, detail="No frame available for this event")
-
-    import os
-    if not os.path.isfile(event.frame_path):
+    if not event.frame_path or not os.path.isfile(event.frame_path):
         raise HTTPException(status_code=404, detail="Frame file not found on disk")
 
     return FileResponse(

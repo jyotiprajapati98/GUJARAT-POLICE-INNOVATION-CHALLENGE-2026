@@ -25,7 +25,7 @@ def _mask_url(url: str) -> str:
     return re.sub(r'(rtsp://)[^@]+@', r'\1****@', url)
 
 
-def _run_anpr(frame, frame_path: str) -> list[dict]:
+def _run_anpr(frame) -> list[dict]:
     """Blocking ANPR call — run in thread pool."""
     try:
         from app.services.anpr_engine import ANPREngine
@@ -36,6 +36,53 @@ def _run_anpr(frame, frame_path: str) -> list[dict]:
     except Exception as e:
         logger.error(f"ANPR error: {e}")
         return []
+
+
+def _annotate_frame(frame, detections: list[dict], camera_label: str, timestamp: datetime):
+    """
+    Draw on a copy of the frame:
+      - Green rectangle around the detected vehicle
+      - Yellow fill strip for the plate crop region (bottom 35% of vehicle box)
+      - Plate text + confidence in bold label
+      - Camera label + timestamp watermark at top-left
+    Returns the annotated frame (original is unchanged).
+    """
+    out = frame.copy()
+    h, w = out.shape[:2]
+
+    # Watermark — camera name + time
+    watermark = f"{camera_label}  {timestamp.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+    cv2.rectangle(out, (0, 0), (len(watermark) * 11 + 12, 28), (0, 0, 0), -1)
+    cv2.putText(out, watermark, (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+
+    for det in detections:
+        bbox = det.get("bbox")
+        if not bbox:
+            continue
+
+        scale = det.get("scale", 1.0)
+        x1, y1, x2, y2 = [int(v / scale) for v in bbox]
+        plate = det["plate_text"]
+        conf = int(det["confidence"] * 100)
+
+        # Vehicle bounding box — green
+        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 220, 0), 2)
+
+        # Plate region highlight — semi-transparent yellow strip
+        plate_y1 = y1 + int((y2 - y1) * 0.65)
+        overlay = out.copy()
+        cv2.rectangle(overlay, (x1, plate_y1), (x2, y2), (0, 230, 255), -1)
+        cv2.addWeighted(overlay, 0.35, out, 0.65, 0, out)
+        cv2.rectangle(out, (x1, plate_y1), (x2, y2), (0, 200, 255), 2)
+
+        # Plate text label above the vehicle box
+        label = f" {plate}  {conf}% "
+        (lw, lh), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
+        label_y = max(y1 - 6, lh + 6)
+        cv2.rectangle(out, (x1, label_y - lh - baseline - 4), (x1 + lw, label_y + 2), (0, 220, 0), -1)
+        cv2.putText(out, label, (x1, label_y - baseline), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 2)
+
+    return out
 
 
 class CameraWorker:
@@ -138,20 +185,21 @@ class CameraWorker:
                 consecutive_failures = 0
                 self.frames_processed += 1
 
-                # Save frame
+                # Run ANPR first (we annotate before saving)
                 timestamp = datetime.utcnow()
+                detections = await asyncio.to_thread(_run_anpr, frame)
+                self.detections_count += len(detections)
+
+                # Annotate frame with bounding boxes + plate text, then save
+                annotated = _annotate_frame(frame, detections, self.camera_id_label, timestamp)
                 frame_dir = os.path.join(settings.FRAMES_DIR, self.camera_id)
                 os.makedirs(frame_dir, exist_ok=True)
                 frame_path = os.path.join(
                     frame_dir, f"{timestamp.strftime('%Y%m%d_%H%M%S')}.jpg"
                 )
-                cv2.imwrite(frame_path, frame)
+                cv2.imwrite(frame_path, annotated, [cv2.IMWRITE_JPEG_QUALITY, 90])
 
-                # Run ANPR in thread pool (blocking call)
-                detections = await asyncio.to_thread(_run_anpr, frame, frame_path)
-                self.detections_count += len(detections)
-
-                # Save events
+                # Save one event per detected plate (each points to the same annotated frame)
                 for det in detections:
                     await process_frame(
                         camera_id=self.camera_id,

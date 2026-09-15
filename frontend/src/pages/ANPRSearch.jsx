@@ -49,9 +49,10 @@ export default function ANPRSearch() {
   // Video test upload
   const [uploadModal, setUploadModal] = useState(false)
   const [uploadFile, setUploadFile] = useState(null)
-  const [uploadJob, setUploadJob] = useState(null)   // {job_id, status, progress, detections}
+  const [uploadJob, setUploadJob] = useState(null)
   const [uploading, setUploading] = useState(false)
   const pollRef = useRef(null)
+  const [testFrameModal, setTestFrameModal] = useState({ open: false, det: null, jobId: null })
 
   const fetchStats = useCallback(async () => {
     setStatsLoading(true)
@@ -150,19 +151,46 @@ export default function ANPRSearch() {
 
   const columns = [
     {
+      title: 'Frame',
+      key: 'frame',
+      width: 100,
+      render: (_, record) => {
+        const frameUrl = analyticsAPI.getFrameUrl(record.id ?? record.event_id)
+        return (
+          <img
+            src={frameUrl}
+            alt="frame"
+            style={{
+              width: 88, height: 56, objectFit: 'cover', borderRadius: 4,
+              cursor: 'pointer', border: '2px solid #d9d9d9',
+              transition: 'border-color 0.2s',
+            }}
+            onClick={() => setFrameModal({ open: true, event: record })}
+            onMouseOver={e => e.currentTarget.style.borderColor = '#1677ff'}
+            onMouseOut={e => e.currentTarget.style.borderColor = '#d9d9d9'}
+            onError={e => {
+              e.currentTarget.style.display = 'none'
+              e.currentTarget.nextSibling.style.display = 'flex'
+            }}
+          />
+        )
+      },
+    },
+    {
       title: 'Plate',
       dataIndex: 'plate_text',
       key: 'plate_text',
       render: (v) => (
-        <span style={{ fontFamily: 'monospace', fontWeight: 'bold', fontSize: 14 }}>
+        <span style={{ fontFamily: 'monospace', fontWeight: 'bold', fontSize: 15, color: '#cf1322' }}>
           {(v ?? '').toUpperCase()}
         </span>
       ),
     },
     {
       title: 'Camera',
-      dataIndex: 'camera_id',
-      key: 'camera_id',
+      dataIndex: 'camera_id_label',
+      key: 'camera_id_label',
+      render: (v, r) => v || r.camera_id || '—',
     },
     {
       title: 'Location',
@@ -181,18 +209,6 @@ export default function ANPRSearch() {
       dataIndex: 'confidence',
       key: 'confidence',
       render: (v) => confidenceLabel(v),
-    },
-    {
-      title: 'Frame',
-      key: 'frame',
-      render: (_, record) => (
-        <Button
-          icon={<CameraOutlined />}
-          size="small"
-          onClick={() => setFrameModal({ open: true, event: record })}
-          title="View Frame"
-        />
-      ),
     },
   ]
 
@@ -424,26 +440,39 @@ export default function ANPRSearch() {
                 dataSource={uploadJob.detections}
                 columns={[
                   {
+                    title: 'Frame',
+                    key: 'frame',
+                    width: 80,
+                    render: (_, record) => record.frame_filename ? (
+                      <img
+                        src={`/api/analytics/v1/anpr/upload-test/${uploadJob.job_id}/frames/${record.frame_filename}?token=${localStorage.getItem('token') || ''}`}
+                        alt="detected"
+                        style={{ width: 64, height: 40, objectFit: 'cover', borderRadius: 4, cursor: 'pointer', border: '1px solid #d9d9d9' }}
+                        onClick={() => setTestFrameModal({ open: true, det: record, jobId: uploadJob.job_id })}
+                      />
+                    ) : '—',
+                  },
+                  {
                     title: 'Plate',
                     dataIndex: 'plate_text',
                     render: (v) => (
-                      <span style={{ fontFamily: 'monospace', fontWeight: 'bold' }}>{v}</span>
+                      <span style={{ fontFamily: 'monospace', fontWeight: 'bold', fontSize: 14 }}>{v}</span>
                     ),
                   },
                   {
-                    title: 'Time in Video',
+                    title: 'Time',
                     dataIndex: 'timestamp_label',
                     render: (v) => <Tag>{v}</Tag>,
                   },
                   {
-                    title: 'OCR Confidence',
+                    title: 'OCR Conf',
                     dataIndex: 'confidence',
                     render: (v) => confidenceLabel(v),
                   },
                   {
                     title: 'Detect Conf',
                     dataIndex: 'detect_confidence',
-                    render: (v) => confidenceLabel(v),
+                    render: (v) => v ? confidenceLabel(v) : <Tag>—</Tag>,
                   },
                 ]}
               />
@@ -453,6 +482,43 @@ export default function ANPRSearch() {
               Test Another Video
             </Button>
           </Space>
+        )}
+      </Modal>
+
+      {/* Video test detected frame modal */}
+      <Modal
+        open={testFrameModal.open}
+        title={
+          testFrameModal.det
+            ? <span>Frame — <span style={{ fontFamily: 'monospace', fontWeight: 'bold', color: '#cf1322' }}>{testFrameModal.det.plate_text}</span> at {testFrameModal.det.timestamp_label}</span>
+            : 'Detected Frame'
+        }
+        onCancel={() => setTestFrameModal({ open: false, det: null, jobId: null })}
+        footer={null}
+        width={780}
+      >
+        {testFrameModal.det && testFrameModal.jobId && (
+          <>
+            <img
+              src={`/api/analytics/v1/anpr/upload-test/${testFrameModal.jobId}/frames/${testFrameModal.det.frame_filename}?token=${localStorage.getItem('token') || ''}`}
+              alt="Detected frame"
+              style={{ width: '100%', borderRadius: 8, marginBottom: 16 }}
+            />
+            <Descriptions bordered size="small" column={2}>
+              <Descriptions.Item label="Plate">
+                <span style={{ fontFamily: 'monospace', fontWeight: 'bold' }}>{testFrameModal.det.plate_text}</span>
+              </Descriptions.Item>
+              <Descriptions.Item label="Time in Video">
+                <Tag>{testFrameModal.det.timestamp_label}</Tag>
+              </Descriptions.Item>
+              <Descriptions.Item label="OCR Confidence">
+                {confidenceLabel(testFrameModal.det.confidence)}
+              </Descriptions.Item>
+              <Descriptions.Item label="Vehicle Detect Conf">
+                {testFrameModal.det.detect_confidence ? confidenceLabel(testFrameModal.det.detect_confidence) : '—'}
+              </Descriptions.Item>
+            </Descriptions>
+          </>
         )}
       </Modal>
 
