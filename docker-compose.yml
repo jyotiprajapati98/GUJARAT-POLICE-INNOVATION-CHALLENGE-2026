@@ -1,0 +1,139 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgis/postgis:15-3.3
+    container_name: raksha_db
+    environment:
+      POSTGRES_DB: raksha
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d raksha"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - raksha_net
+
+  registry-svc:
+    build:
+      context: ./services/registry-svc
+      dockerfile: Dockerfile
+    container_name: raksha_registry
+    ports:
+      - "8001:8000"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/raksha
+      SECRET_KEY: raksha-shared-secret-key-change-in-production-2024
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 480
+      SERVICE_NAME: registry-svc
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./services/registry-svc:/app
+    restart: unless-stopped
+    networks:
+      - raksha_net
+
+  streaming-svc:
+    build:
+      context: ./services/streaming-svc
+      dockerfile: Dockerfile
+    container_name: raksha_streaming
+    ports:
+      - "8003:8000"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/raksha
+      SECRET_KEY: raksha-shared-secret-key-change-in-production-2024
+      ALGORITHM: HS256
+      HLS_DIR: /app/hls
+      SESSION_TIMEOUT_SECONDS: 60
+      HEALTH_CHECK_INTERVAL_SECONDS: 60
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./services/streaming-svc:/app
+      - hls_data:/app/hls
+    restart: unless-stopped
+    # Use host network mode so the container can reach the camera at 172.23.101.137
+    # which is on the same LAN as the host machine
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - raksha_net
+
+  analytics-svc:
+    build:
+      context: ./services/analytics-svc
+      dockerfile: Dockerfile
+    container_name: raksha_analytics
+    ports:
+      - "8004:8000"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/raksha
+      SECRET_KEY: raksha-shared-secret-key-change-in-production-2024
+      ALGORITHM: HS256
+      FRAMES_DIR: /app/frames
+      RECORDINGS_DIR: /app/recordings
+      MODELS_CACHE_DIR: /app/models_cache
+      ANPR_DETECT_CONF: "0.60"
+      ANPR_OCR_CONF: "0.70"
+      FRAME_RATE: "1"
+      REGISTRY_API_URL: http://registry-svc:8000/api/v1
+      STREAMING_API_URL: http://streaming-svc:8000/api/v1
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - frames_data:/app/frames
+      - recordings_data:/app/recordings
+      - models_cache:/app/models_cache
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    networks:
+      - raksha_net
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: raksha_frontend
+    ports:
+      - "3000:80"
+    volumes:
+      - hls_data:/app/hls:ro
+    depends_on:
+      - registry-svc
+      - streaming-svc
+      - analytics-svc
+    restart: unless-stopped
+    networks:
+      - raksha_net
+
+volumes:
+  postgres_data:
+    name: raksha_pgdata
+  hls_data:
+    name: raksha_hls
+  frames_data:
+    name: raksha_frames
+  recordings_data:
+    name: raksha_recordings
+  models_cache:
+    name: raksha_models_cache
+
+networks:
+  raksha_net:
+    driver: bridge
+    ipam:
+      config:
+        # Use 10.10.0.0/16 to avoid conflicting with camera subnet 172.23.x.x
+        - subnet: 10.10.0.0/16
